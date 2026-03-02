@@ -51,6 +51,8 @@ def is_interrupted() -> bool:
 # Constants
 AGENT_TIMEOUT_SECONDS = 300
 DEFAULT_DEPENDENCY_AGE_DAYS = 30
+DEFAULT_CI_TIMEOUT_MINUTES = 10
+DEFAULT_MAX_CI_FIX_ATTEMPTS = 3
 REPO_URL = "https://github.com/andornaut/github-maintainer"
 COMMIT_MESSAGE = f"chore: automated maintenance\n\nCreated by github-maintainer\n{REPO_URL}"
 COMMIT_MESSAGE_FIX = f"fix: CI build failure\n\nCreated by github-maintainer\n{REPO_URL}"
@@ -113,7 +115,7 @@ class RepoMaintainer:
 
     def is_workdir_clean(self) -> bool:
         """Check if working directory is clean."""
-        success, stdout, _ = self.run_command(["git", "status", "--porcelain"])
+        success, stdout, _ = self.run_command(["git", "status", "--porcelain"], check=False)
         return success and not stdout.strip()
 
     def is_gh_authenticated(self) -> bool:
@@ -190,7 +192,8 @@ class RepoMaintainer:
                 "app/dependabot",
                 "--json",
                 "number,title,author,headRefName,url",
-            ]
+            ],
+            check=False,
         )
         if not success:
             return []
@@ -199,13 +202,6 @@ class RepoMaintainer:
             return json.loads(stdout)
         except json.JSONDecodeError:
             return []
-
-    def get_latest_commit_author(self) -> Optional[str]:
-        """Get the author of the latest commit."""
-        success, stdout, _ = self.run_command(
-            ["git", "log", "-1", "--format=%an"], check=False
-        )
-        return stdout.strip() if success else None
 
     def is_latest_commit_from_maintainer(self) -> bool:
         """Check if the latest commit was created by github-maintainer."""
@@ -260,7 +256,16 @@ class RepoMaintainer:
             )
             return None
 
-        self.logger.debug(f"[{self.repo_name}] Waiting for CI to complete...")
+        # Get current HEAD SHA to verify we're checking the right CI run
+        success, head_sha, _ = self.run_command(
+            ["git", "rev-parse", "HEAD"], check=False
+        )
+        if not success:
+            self.logger.warning(f"[{self.repo_name}] Could not get HEAD SHA")
+            return None
+        head_sha = head_sha.strip()
+
+        self.logger.debug(f"[{self.repo_name}] Waiting for CI on commit {head_sha[:7]}...")
 
         # Poll for CI status
         poll_interval = 30  # seconds
@@ -272,7 +277,7 @@ class RepoMaintainer:
 
             success, stdout, _ = self.run_command(
                 ["gh", "run", "list", "--branch", self.get_current_branch() or "main",
-                 "--limit", "1", "--json", "status,conclusion"],
+                 "--limit", "5", "--json", "status,conclusion,headSha"],
                 check=False,
             )
             if not success:
@@ -284,7 +289,19 @@ class RepoMaintainer:
                     time.sleep(poll_interval)
                     continue
 
-                run = runs[0]
+                # Find the run for our commit
+                run = None
+                for r in runs:
+                    if r.get("headSha") == head_sha:
+                        run = r
+                        break
+
+                if not run:
+                    # No CI run for our commit yet, wait for it to start
+                    self.logger.debug(f"[{self.repo_name}] No CI run for {head_sha[:7]} yet, waiting...")
+                    time.sleep(poll_interval)
+                    continue
+
                 status = run.get("status")
                 conclusion = run.get("conclusion")
 
@@ -360,6 +377,7 @@ class RepoMaintainer:
 
             if not fixed:
                 self.logger.warning(f"[{self.repo_name}] AI could not fix the issue: {reasoning}")
+                self.reset_changes()  # Clean up any partial changes
                 return False
 
             self.logger.info(f"[{self.repo_name}] AI fix: {changes_made}")
@@ -368,6 +386,7 @@ class RepoMaintainer:
             tests_passed, test_output = self.run_tests()
             if not tests_passed:
                 self.logger.error(f"[{self.repo_name}] Fix verification failed - tests still failing")
+                self.reset_changes()  # Clean up failed fix attempt
                 return False
 
             # Commit and push the fix
@@ -376,11 +395,55 @@ class RepoMaintainer:
                 return False
 
             success, _ = self.commit_and_push(COMMIT_MESSAGE_FIX)
+            if not success:
+                self.reset_changes()  # Clean up if commit/push failed
             return success
 
         except json.JSONDecodeError as e:
             self.logger.error(f"[{self.repo_name}] Failed to parse AI fix response: {e}")
+            self.reset_changes()  # Clean up any partial changes
             return False
+
+    def fix_ci_with_retries(self) -> bool:
+        """Attempt to fix CI failures with retry logic.
+
+        Returns True if CI eventually passes, False otherwise.
+        """
+        max_attempts = self.config.get("max_ci_fix_attempts", DEFAULT_MAX_CI_FIX_ATTEMPTS)
+        ci_timeout = self.config.get("ci_timeout", DEFAULT_CI_TIMEOUT_MINUTES)
+
+        for attempt in range(1, max_attempts + 1):
+            logs = self.get_ci_failure_logs()
+            if not logs:
+                self.logger.error(f"[{self.repo_name}] Could not get CI failure logs")
+                return False
+
+            self.logger.info(f"[{self.repo_name}] CI fix attempt {attempt}/{max_attempts}")
+
+            if not self.fix_ci_failure(logs):
+                self.logger.error(f"[{self.repo_name}] Fix attempt {attempt} failed")
+                if attempt < max_attempts:
+                    continue  # Try again
+                return False
+
+            # Wait for CI to complete after fix
+            self.logger.info(f"[{self.repo_name}] Waiting for CI after fix...")
+            ci_status = self.get_ci_status(ci_timeout)
+
+            if ci_status == "success":
+                self.logger.info(f"[{self.repo_name}] CI passed after {attempt} fix attempt(s)")
+                return True
+            elif ci_status == "failure":
+                self.logger.warning(f"[{self.repo_name}] CI still failing after fix attempt {attempt}")
+                if attempt >= max_attempts:
+                    self.logger.error(f"[{self.repo_name}] Exhausted all {max_attempts} fix attempts")
+                    return False
+                # Continue to next attempt
+            else:
+                self.logger.error(f"[{self.repo_name}] Could not determine CI status after fix")
+                return False
+
+        return False
 
     def close_dependabot_prs(self, pr_numbers: List[int]) -> None:
         """Close dependabot PRs after they've been merged locally and pushed."""
@@ -642,8 +705,8 @@ Please respond with a JSON object containing your decision and reasoning.
                         self.run_command(["git", "merge", "--abort"], check=False)
                         return False, merged_prs
 
-                    # Commit the squashed merge
-                    commit_msg = f"Merge dependabot PR #{pr_num}"
+                    # Commit the squashed merge (with attribution for tracking)
+                    commit_msg = f"Merge dependabot PR #{pr_num}\n\nCreated by github-maintainer\n{REPO_URL}"
                     success, _, stderr = self.run_command(
                         ["git", "commit", "-m", commit_msg],
                         check=False,
@@ -878,6 +941,11 @@ Please respond with a JSON object containing your decision and reasoning.
             self.logger.debug(f"[{self.repo_name}] Skipping self")
             return False, False
 
+        # Skip excluded repositories
+        if self.repo_name in self.config.get("exclude", set()):
+            self.logger.debug(f"[{self.repo_name}] Excluded by --exclude flag, skipping")
+            return False, False
+
         # Check prerequisites
         if not self.is_git_repo():
             self.logger.debug(f"[{self.repo_name}] Not a git repository, skipping")
@@ -932,18 +1000,12 @@ Please respond with a JSON object containing your decision and reasoning.
                     self.logger.warning(
                         f"[{self.repo_name}] CI is failing from a previous github-maintainer run, will attempt to fix"
                     )
-                    # Try to fix the existing failure before making more changes
-                    logs = self.get_ci_failure_logs()
-                    if logs:
-                        if self.fix_ci_failure(logs):
-                            self.logger.info(f"[{self.repo_name}] Previous CI failure fixed")
-                            ci_was_passing = True  # Now it should pass
-                        else:
-                            self.logger.error(f"[{self.repo_name}] Could not fix previous CI failure, skipping repo")
-                            return False, False
+                    if self.fix_ci_with_retries():
+                        self.logger.info(f"[{self.repo_name}] Previous CI failure fixed")
+                        ci_was_passing = True
                     else:
-                        self.logger.error(f"[{self.repo_name}] Could not get CI failure logs")
-                        return False, False
+                        self.logger.error(f"[{self.repo_name}] Could not fix previous CI failure, skipping repo")
+                        return False, True  # Had changes (fix attempts) but failed
                 else:
                     self.logger.warning(
                         f"[{self.repo_name}] CI is already failing (not from github-maintainer), will not attempt fixes"
@@ -987,21 +1049,16 @@ Please respond with a JSON object containing your decision and reasoning.
 
         # Check CI status and fix failures if we caused them
         if committed_changes and self.config.get("wait_for_ci"):
-            ci_status = self.get_ci_status()
+            ci_status = self.get_ci_status(self.config.get("ci_timeout", DEFAULT_CI_TIMEOUT_MINUTES))
             if ci_status == "failure":
                 if ci_was_passing:
                     # CI was passing before, we likely broke it - try to fix
                     self.logger.warning(f"[{self.repo_name}] CI failed after push, attempting to fix...")
-                    logs = self.get_ci_failure_logs()
-                    if logs:
-                        if self.fix_ci_failure(logs):
-                            self.logger.info(f"[{self.repo_name}] CI failure fixed and pushed")
-                        else:
-                            self.logger.error(f"[{self.repo_name}] Failed to fix CI failure")
-                            return False, True  # Had changes but CI failed
+                    if self.fix_ci_with_retries():
+                        self.logger.info(f"[{self.repo_name}] CI failure fixed")
                     else:
-                        self.logger.error(f"[{self.repo_name}] Could not get CI failure logs")
-                        return False, True
+                        self.logger.error(f"[{self.repo_name}] Failed to fix CI failure")
+                        return False, True  # Had changes but CI failed
                 else:
                     # CI was already failing before our changes
                     self.logger.warning(
@@ -1179,6 +1236,18 @@ Examples:
         action="store_true",
         help="Wait for CI to complete after push and attempt to fix failures",
     )
+    parser.add_argument(
+        "--ci-timeout",
+        type=int,
+        default=DEFAULT_CI_TIMEOUT_MINUTES,
+        help=f"CI polling timeout in minutes (default: {DEFAULT_CI_TIMEOUT_MINUTES})",
+    )
+    parser.add_argument(
+        "--max-ci-fix-attempts",
+        type=int,
+        default=DEFAULT_MAX_CI_FIX_ATTEMPTS,
+        help=f"Maximum attempts to fix CI failures (default: {DEFAULT_MAX_CI_FIX_ATTEMPTS})",
+    )
 
     # Operation mode
     parser.add_argument(
@@ -1193,6 +1262,14 @@ Examples:
         "--limit",
         type=int,
         help="Only update N repositories with changes (default: unlimited)",
+    )
+    parser.add_argument(
+        "--exclude",
+        "-e",
+        action="append",
+        default=[],
+        metavar="REPO",
+        help="Exclude repository by name (can be used multiple times)",
     )
 
     # Logging
@@ -1242,6 +1319,9 @@ def main():
         "run_tests": not args.no_run_tests,
         "push_changes": not args.no_push,
         "wait_for_ci": args.wait_for_ci,
+        "ci_timeout": args.ci_timeout,
+        "max_ci_fix_attempts": args.max_ci_fix_attempts,
+        "exclude": set(args.exclude),
         "dry_run": args.dry_run,
     }
 
