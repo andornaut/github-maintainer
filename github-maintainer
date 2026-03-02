@@ -1,0 +1,1310 @@
+#!/usr/bin/env python3
+"""
+GitHub Maintainer - Automated repository maintenance with AI-assisted decision making.
+
+Manages GitHub repositories by:
+- Pulling latest changes
+- Merging verified dependabot PRs
+- Updating dependencies with age constraints
+- Running tests
+- Committing and pushing changes
+"""
+
+import argparse
+import json
+import logging
+import os
+import shlex
+import shutil
+import signal
+import subprocess
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+__version__ = "0.0.1"
+
+# Global flag for interrupt handling
+_interrupted = False
+
+
+def _signal_handler(_signum, _frame):
+    """Handle SIGINT/SIGTERM for graceful shutdown.
+
+    First signal sets flag and raises KeyboardInterrupt.
+    Second signal forces immediate exit.
+    """
+    global _interrupted
+    if _interrupted:
+        # Second interrupt - force exit immediately
+        print("\nForce quit", file=sys.stderr)
+        os._exit(1)
+    _interrupted = True
+    raise KeyboardInterrupt()
+
+
+def is_interrupted() -> bool:
+    """Check if an interrupt has been requested."""
+    return _interrupted
+
+# Constants
+AGENT_TIMEOUT_SECONDS = 300
+DEFAULT_DEPENDENCY_AGE_DAYS = 30
+REPO_URL = "https://github.com/andornaut/github-maintainer"
+COMMIT_MESSAGE = f"chore: automated maintenance\n\nCreated by github-maintainer\n{REPO_URL}"
+COMMIT_MESSAGE_FIX = f"fix: CI build failure\n\nCreated by github-maintainer\n{REPO_URL}"
+
+
+class RepoMaintainer:
+    """Manages repository maintenance tasks with AI assistance."""
+
+    def __init__(self, repo_path: Path, config: Dict[str, Any]):
+        self.repo_path = repo_path
+        self.repo_name = repo_path.name
+        self.config = config
+        self.logger = logging.getLogger(__name__)
+
+    def run_command(self, cmd: List[str], check: bool = True) -> Tuple[bool, str, str]:
+        """Run a command and return (success, stdout, stderr)."""
+        if is_interrupted():
+            raise KeyboardInterrupt()
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                check=check,
+                start_new_session=True,  # Prevent SIGINT from going to subprocess
+            )
+            return True, result.stdout, result.stderr
+        except subprocess.CalledProcessError as e:
+            return False, e.stdout, e.stderr
+        except Exception as e:
+            return False, "", str(e)
+
+    def is_git_repo(self) -> bool:
+        """Check if directory is a git repository."""
+        return (self.repo_path / ".git").exists()
+
+    def get_default_branch(self) -> Optional[str]:
+        """Get the default branch name (main or master).
+
+        Prefers main over master since origin/HEAD can be stale after
+        GitHub's default branch migration.
+        """
+        success, stdout, _ = self.run_command(["git", "branch", "-a"], check=False)
+        if success:
+            branches = stdout.strip()
+            # Prefer main (modern convention) over master
+            if "remotes/origin/main" in branches:
+                return "main"
+            elif "remotes/origin/master" in branches:
+                return "master"
+        return None
+
+    def get_current_branch(self) -> Optional[str]:
+        """Get current branch name."""
+        success, stdout, _ = self.run_command(
+            ["git", "branch", "--show-current"], check=False
+        )
+        return stdout.strip() if success else None
+
+    def is_workdir_clean(self) -> bool:
+        """Check if working directory is clean."""
+        success, stdout, _ = self.run_command(["git", "status", "--porcelain"])
+        return success and not stdout.strip()
+
+    def is_gh_authenticated(self) -> bool:
+        """Check if GitHub CLI is authenticated."""
+        success, _, _ = self.run_command(["gh", "auth", "status"], check=False)
+        return success
+
+    def reset_changes(self) -> bool:
+        """Reset working directory to HEAD, discarding all uncommitted changes."""
+        self.logger.debug(f"[{self.repo_name}] Resetting working directory...")
+        # Reset staged and unstaged changes
+        success, _, stderr = self.run_command(
+            ["git", "checkout", "--", "."], check=False
+        )
+        if not success:
+            self.logger.error(f"[{self.repo_name}] Failed to reset changes: {stderr}")
+            return False
+        # Remove untracked files
+        success, _, stderr = self.run_command(
+            ["git", "clean", "-fd"], check=False
+        )
+        if not success:
+            self.logger.error(f"[{self.repo_name}] Failed to clean untracked files: {stderr}")
+            return False
+        self.logger.debug(f"[{self.repo_name}] Working directory reset")
+        return True
+
+    def _extract_json_from_response(self, response: str) -> str:
+        """Extract JSON from agent response, handling markdown code blocks."""
+        response_text = response.strip()
+
+        # Try to find JSON code block
+        if "```json" in response_text:
+            start_marker = "```json"
+            start_idx = response_text.find(start_marker)
+            if start_idx != -1:
+                json_start = start_idx + len(start_marker)
+                # Find the matching closing ``` after the start marker
+                json_end = response_text.find("```", json_start)
+                if json_end != -1:
+                    return response_text[json_start:json_end].strip()
+
+        # Try to find generic code block
+        if "```" in response_text:
+            first_backtick = response_text.find("```")
+            if first_backtick != -1:
+                json_start = first_backtick + 3
+                json_end = response_text.find("```", json_start)
+                if json_end != -1:
+                    return response_text[json_start:json_end].strip()
+
+        # No code blocks found, return as-is
+        return response_text
+
+    def pull_changes(self) -> bool:
+        """Pull latest changes from remote."""
+        self.logger.debug(f"[{self.repo_name}] Pulling changes...")
+        success, _, stderr = self.run_command(["git", "pull"], check=False)
+        if success:
+            self.logger.debug(f"[{self.repo_name}] Pull successful")
+            return True
+        else:
+            self.logger.error(f"[{self.repo_name}] Pull failed: {stderr}")
+            return False
+
+    def get_dependabot_prs(self) -> List[Dict[str, Any]]:
+        """Get open dependabot PRs using gh CLI."""
+        success, stdout, _ = self.run_command(
+            [
+                "gh",
+                "pr",
+                "list",
+                "--author",
+                "app/dependabot",
+                "--json",
+                "number,title,author,headRefName,url",
+            ]
+        )
+        if not success:
+            return []
+
+        try:
+            return json.loads(stdout)
+        except json.JSONDecodeError:
+            return []
+
+    def get_latest_commit_author(self) -> Optional[str]:
+        """Get the author of the latest commit."""
+        success, stdout, _ = self.run_command(
+            ["git", "log", "-1", "--format=%an"], check=False
+        )
+        return stdout.strip() if success else None
+
+    def is_latest_commit_from_maintainer(self) -> bool:
+        """Check if the latest commit was created by github-maintainer."""
+        success, stdout, _ = self.run_command(
+            ["git", "log", "-1", "--format=%B"], check=False
+        )
+        if not success:
+            return False
+        # Check for our attribution in the commit message
+        return REPO_URL in stdout or "github-maintainer" in stdout.lower()
+
+    def get_latest_ci_conclusion(self) -> Optional[str]:
+        """Get the conclusion of the latest CI run without waiting.
+
+        Returns 'success', 'failure', 'in_progress', or None if unable to determine.
+        """
+        if not self.is_gh_authenticated():
+            return None
+
+        success, stdout, _ = self.run_command(
+            ["gh", "run", "list", "--branch", self.get_current_branch() or "main",
+             "--limit", "1", "--json", "status,conclusion"],
+            check=False,
+        )
+        if not success:
+            return None
+
+        try:
+            runs = json.loads(stdout)
+            if not runs:
+                return None
+            run = runs[0]
+            status = run.get("status")
+            if status != "completed":
+                return "in_progress"
+            return run.get("conclusion")
+        except json.JSONDecodeError:
+            return None
+
+    def get_ci_status(self, timeout_minutes: int = 10) -> Optional[str]:
+        """Wait for and get the CI status of the latest commit.
+
+        Returns 'success', 'failure', or None if unable to determine.
+        """
+        import time
+
+        # Check gh authentication first
+        if not self.is_gh_authenticated():
+            self.logger.warning(
+                f"[{self.repo_name}] GitHub CLI not authenticated, skipping CI check. "
+                "Run 'gh auth login' to enable CI monitoring."
+            )
+            return None
+
+        self.logger.debug(f"[{self.repo_name}] Waiting for CI to complete...")
+
+        # Poll for CI status
+        poll_interval = 30  # seconds
+        max_polls = (timeout_minutes * 60) // poll_interval
+
+        for _ in range(max_polls):
+            if is_interrupted():
+                raise KeyboardInterrupt()
+
+            success, stdout, _ = self.run_command(
+                ["gh", "run", "list", "--branch", self.get_current_branch() or "main",
+                 "--limit", "1", "--json", "status,conclusion"],
+                check=False,
+            )
+            if not success:
+                return None
+
+            try:
+                runs = json.loads(stdout)
+                if not runs:
+                    time.sleep(poll_interval)
+                    continue
+
+                run = runs[0]
+                status = run.get("status")
+                conclusion = run.get("conclusion")
+
+                if status == "completed":
+                    self.logger.debug(f"[{self.repo_name}] CI completed: {conclusion}")
+                    return conclusion  # 'success', 'failure', 'cancelled', etc.
+
+                self.logger.debug(f"[{self.repo_name}] CI status: {status}, waiting...")
+                time.sleep(poll_interval)
+
+            except json.JSONDecodeError:
+                return None
+
+        self.logger.warning(f"[{self.repo_name}] CI timed out after {timeout_minutes} minutes")
+        return None
+
+    def get_ci_failure_logs(self) -> Optional[str]:
+        """Get the logs from the latest failed CI run."""
+        # Get the latest run ID
+        success, stdout, _ = self.run_command(
+            ["gh", "run", "list", "--branch", self.get_current_branch() or "main",
+             "--limit", "1", "--json", "databaseId"],
+            check=False,
+        )
+        if not success:
+            return None
+
+        try:
+            runs = json.loads(stdout)
+            if not runs:
+                return None
+            run_id = runs[0].get("databaseId")
+        except (json.JSONDecodeError, KeyError):
+            return None
+
+        # Get the failed job logs
+        success, stdout, _ = self.run_command(
+            ["gh", "run", "view", str(run_id), "--log-failed"],
+            check=False,
+        )
+        if success and stdout:
+            # Truncate if too long
+            max_len = 10000
+            if len(stdout) > max_len:
+                return stdout[:max_len] + "\n... (truncated)"
+            return stdout
+        return None
+
+    def fix_ci_failure(self, logs: str) -> bool:
+        """Ask AI agent to fix a CI failure and retry.
+
+        Returns True if fix was successful and pushed.
+        """
+        self.logger.info(f"[{self.repo_name}] Asking AI to fix CI failure...")
+
+        response = self.ask_agent(
+            "The CI build failed after pushing changes. Analyze the error logs and fix the issue. "
+            "Make the necessary code changes to fix the build. "
+            "After fixing, run the build/test commands locally to verify the fix works. "
+            "Return a JSON object with 'fixed' (boolean), 'changes_made' (string describing what you fixed), "
+            "and 'reasoning' (string).",
+            context={"ci_logs": logs},
+        )
+
+        try:
+            response_text = self._extract_json_from_response(response)
+            decision = json.loads(response_text)
+            fixed = decision.get("fixed", False)
+            changes_made = decision.get("changes_made", "No changes described")
+            reasoning = decision.get("reasoning", "No reasoning provided")
+
+            self.logger.debug(f"[{self.repo_name}] AI fix attempt: {reasoning}")
+
+            if not fixed:
+                self.logger.warning(f"[{self.repo_name}] AI could not fix the issue: {reasoning}")
+                return False
+
+            self.logger.info(f"[{self.repo_name}] AI fix: {changes_made}")
+
+            # Run tests locally to verify fix
+            tests_passed, test_output = self.run_tests()
+            if not tests_passed:
+                self.logger.error(f"[{self.repo_name}] Fix verification failed - tests still failing")
+                return False
+
+            # Commit and push the fix
+            if self.is_workdir_clean():
+                self.logger.warning(f"[{self.repo_name}] AI claimed to fix but no changes made")
+                return False
+
+            success, _ = self.commit_and_push(COMMIT_MESSAGE_FIX)
+            return success
+
+        except json.JSONDecodeError as e:
+            self.logger.error(f"[{self.repo_name}] Failed to parse AI fix response: {e}")
+            return False
+
+    def close_dependabot_prs(self, pr_numbers: List[int]) -> None:
+        """Close dependabot PRs after they've been merged locally and pushed."""
+        for pr_num in pr_numbers:
+            if self.config["dry_run"]:
+                self.logger.info(f"[{self.repo_name}] DRY RUN: Would close PR #{pr_num}")
+            else:
+                success, _, stderr = self.run_command(
+                    ["gh", "pr", "close", str(pr_num), "--comment",
+                     "Closed: merged locally by github-maintainer"],
+                    check=False,
+                )
+                if success:
+                    self.logger.debug(f"[{self.repo_name}] Closed PR #{pr_num}")
+                else:
+                    self.logger.warning(
+                        f"[{self.repo_name}] Failed to close PR #{pr_num}: {stderr}"
+                    )
+
+    def _has_make_target(self, target: str) -> bool:
+        """Check if Makefile has a specific target."""
+        success, _, _ = self.run_command(["make", "-n", target], check=False)
+        return success
+
+    def _get_npm_test_script(self) -> Optional[str]:
+        """Get npm test script from package.json."""
+        try:
+            with open(self.repo_path / "package.json", encoding="utf-8") as f:
+                pkg = json.load(f)
+                if "scripts" in pkg and "test" in pkg["scripts"]:
+                    return "npm test"
+        except (json.JSONDecodeError, FileNotFoundError):
+            pass
+        return None
+
+    def detect_test_command(self) -> Optional[str]:
+        """Detect how to run tests in this repository."""
+        # Check patterns in priority order
+        test_patterns = [
+            ("package.json", lambda: self._get_npm_test_script()),
+            ("tox.ini", lambda: "tox"),
+            (
+                "pyproject.toml",
+                lambda: "pytest" if (self.repo_path / "tests").exists() else None,
+            ),
+            ("pytest.ini", lambda: "pytest"),
+            ("setup.py", lambda: "pytest"),
+            ("Cargo.toml", lambda: "cargo test"),
+            ("go.mod", lambda: "go test ./..."),
+            (
+                "Makefile",
+                lambda: "make test" if self._has_make_target("test") else None,
+            ),
+        ]
+
+        for file_name, detector in test_patterns:
+            if (self.repo_path / file_name).exists():
+                cmd = detector()
+                if cmd:
+                    return cmd
+
+        return None
+
+    def run_tests(self) -> Tuple[bool, str]:
+        """Run tests if available."""
+        if not self.config["run_tests"]:
+            return True, "Tests skipped (disabled in config)"
+
+        test_cmd = self.detect_test_command()
+
+        if test_cmd:
+            self.logger.debug(f"[{self.repo_name}] Running tests: {test_cmd}")
+            success, stdout, stderr = self.run_command(
+                shlex.split(test_cmd), check=False
+            )
+            output = f"STDOUT:\n{stdout}\n\nSTDERR:\n{stderr}"
+
+            if success:
+                self.logger.debug(f"[{self.repo_name}] Tests passed")
+                return True, output
+            else:
+                self.logger.error(f"[{self.repo_name}] Tests failed")
+                return False, output
+        else:
+            self.logger.debug(f"[{self.repo_name}] No test command detected")
+            return True, "No tests detected"
+
+    def has_ci_workflow(self) -> bool:
+        """Check if repository has CI/CD workflows."""
+        workflows_dir = self.repo_path / ".github" / "workflows"
+        if not workflows_dir.exists():
+            return False
+
+        # Check if there are any workflow files
+        workflow_files = list(workflows_dir.glob("*.yml")) + list(
+            workflows_dir.glob("*.yaml")
+        )
+        return bool(workflow_files)
+
+    def ask_agent(self, prompt: str, context: Optional[Dict[str, Any]] = None) -> str:
+        """Ask the AI agent for a decision."""
+        # Build the full prompt with context
+        full_prompt = f"""Repository: {self.repo_name}
+Path: {self.repo_path}
+
+Context:
+{json.dumps(context, indent=2) if context else "No additional context"}
+
+Task: {prompt}
+
+Please respond with a JSON object containing your decision and reasoning.
+"""
+
+        self.logger.debug(f"[{self.repo_name}] Asking agent: {prompt[:100]}...")
+
+        # Build agent command
+        agent_cmd = shlex.split(self.config["agent_command"])
+        if not agent_cmd:
+            self.logger.error(f"[{self.repo_name}] Empty agent command")
+            return json.dumps({"error": "Empty agent command"})
+
+        if self.config.get("agent_flags"):
+            agent_cmd.extend(shlex.split(self.config["agent_flags"]))
+
+        # Add the prompt as the last argument
+        agent_cmd.append(full_prompt)
+
+        try:
+            if is_interrupted():
+                raise KeyboardInterrupt()
+
+            # Unset CLAUDECODE to allow nested claude calls if needed
+            env = os.environ.copy()
+            env.pop("CLAUDECODE", None)
+
+            result = subprocess.run(
+                agent_cmd,
+                capture_output=True,
+                text=True,
+                timeout=AGENT_TIMEOUT_SECONDS,
+                env=env,
+                start_new_session=True,  # Prevent SIGINT from going to subprocess
+            )
+
+            if result.returncode == 0:
+                return result.stdout
+            else:
+                self.logger.error(f"[{self.repo_name}] Agent failed: {result.stderr}")
+                return json.dumps({"error": result.stderr})
+        except subprocess.TimeoutExpired:
+            self.logger.error(f"[{self.repo_name}] Agent timed out")
+            return json.dumps({"error": "Agent timed out"})
+        except Exception as e:
+            self.logger.error(f"[{self.repo_name}] Agent error: {e}")
+            return json.dumps({"error": str(e)})
+
+    def merge_dependabot_prs(self) -> Tuple[bool, List[int]]:
+        """Merge dependabot PRs locally after AI verification.
+
+        Returns:
+            Tuple of (success, merged_prs) where:
+            - success: whether the operation completed successfully
+            - merged_prs: list of PR numbers that were merged
+        """
+        if not self.config["auto_merge_dependabot"]:
+            self.logger.debug(f"[{self.repo_name}] Dependabot auto-merge disabled")
+            return True, []
+
+        prs = self.get_dependabot_prs()
+        if not prs:
+            self.logger.debug(f"[{self.repo_name}] No dependabot PRs found")
+            return True, []
+
+        self.logger.debug(f"[{self.repo_name}] Found {len(prs)} dependabot PR(s)")
+
+        # Ask agent to verify PRs
+        response = self.ask_agent(
+            "Analyze these dependabot PRs and tell me which ones are safe to merge. "
+            "Verify they are from the legitimate dependabot bot, not a malicious actor. "
+            "Return a JSON object with 'safe_prs' (list of PR numbers) and 'reasoning' (string).",
+            context={"prs": prs},
+        )
+
+        try:
+            # Extract JSON from response (handles markdown code blocks)
+            response_text = self._extract_json_from_response(response)
+            decision = json.loads(response_text)
+            safe_prs = decision.get("safe_prs", [])
+            reasoning = decision.get("reasoning", "No reasoning provided")
+
+            # Validate response structure
+            if not isinstance(safe_prs, list):
+                self.logger.error(
+                    f"[{self.repo_name}] Invalid agent response: safe_prs must be a list"
+                )
+                return False, []
+
+            # Validate that all items in safe_prs are integers
+            if not all(isinstance(pr, int) for pr in safe_prs):
+                self.logger.error(
+                    f"[{self.repo_name}] Invalid agent response: safe_prs must contain only integers"
+                )
+                return False, []
+
+            self.logger.debug(f"[{self.repo_name}] Agent reasoning: {reasoning}")
+
+            if not safe_prs:
+                self.logger.debug(f"[{self.repo_name}] No PRs deemed safe to merge")
+                return True, []
+
+            # Merge safe PRs locally
+            merged_prs: List[int] = []
+            for pr_num in safe_prs:
+                if self.config["dry_run"]:
+                    self.logger.info(
+                        f"[{self.repo_name}] DRY RUN: Would merge PR #{pr_num} locally"
+                    )
+                    merged_prs.append(pr_num)
+                else:
+                    self.logger.debug(f"[{self.repo_name}] Fetching and merging PR #{pr_num} locally")
+
+                    # Get PR branch name
+                    success, stdout, stderr = self.run_command(
+                        ["gh", "pr", "view", str(pr_num), "--json", "headRefName", "-q", ".headRefName"],
+                        check=False,
+                    )
+                    if not success:
+                        self.logger.error(
+                            f"[{self.repo_name}] Failed to get PR #{pr_num} branch name: {stderr}"
+                        )
+                        return False, merged_prs
+
+                    branch_name = stdout.strip()
+                    if not branch_name:
+                        self.logger.error(f"[{self.repo_name}] Empty branch name for PR #{pr_num}")
+                        return False, merged_prs
+
+                    # Fetch the PR branch
+                    success, _, stderr = self.run_command(
+                        ["git", "fetch", "origin", branch_name],
+                        check=False,
+                    )
+                    if not success:
+                        self.logger.error(
+                            f"[{self.repo_name}] Failed to fetch PR #{pr_num} branch {branch_name}: {stderr}"
+                        )
+                        return False, merged_prs
+
+                    # Merge the PR branch
+                    success, _, stderr = self.run_command(
+                        ["git", "merge", "--squash", f"origin/{branch_name}"],
+                        check=False,
+                    )
+                    if not success:
+                        self.logger.error(
+                            f"[{self.repo_name}] Failed to merge PR #{pr_num} branch {branch_name}: {stderr}"
+                        )
+                        # Abort the merge
+                        self.run_command(["git", "merge", "--abort"], check=False)
+                        return False, merged_prs
+
+                    # Commit the squashed merge
+                    commit_msg = f"Merge dependabot PR #{pr_num}"
+                    success, _, stderr = self.run_command(
+                        ["git", "commit", "-m", commit_msg],
+                        check=False,
+                    )
+                    if not success:
+                        self.logger.error(
+                            f"[{self.repo_name}] Failed to commit merge of PR #{pr_num}: {stderr}"
+                        )
+                        return False, merged_prs
+
+                    self.logger.info(
+                        f"[{self.repo_name}] PR #{pr_num} merged locally successfully"
+                    )
+                    merged_prs.append(pr_num)
+
+            return True, merged_prs
+
+        except json.JSONDecodeError as e:
+            self.logger.error(f"[{self.repo_name}] Failed to parse agent response: {e}")
+            self.logger.error(f"[{self.repo_name}] Agent response was: {response}")
+            return False, []
+
+    def update_dependencies(self) -> Tuple[bool, bool]:
+        """Update dependencies based on AI analysis.
+
+        Returns:
+            Tuple of (success, had_updates) where:
+            - success: whether the operation completed successfully
+            - had_updates: whether any dependencies were updated
+        """
+        if not self.config["auto_update_dependencies"]:
+            self.logger.debug(f"[{self.repo_name}] Dependency auto-update disabled")
+            return True, False
+
+        if not self.has_ci_workflow():
+            self.logger.debug(
+                f"[{self.repo_name}] No CI workflow detected, skipping dependency updates"
+            )
+            return True, False
+
+        # Collect dependency files
+        dep_files = []
+        for pattern in [
+            "package.json",
+            "pyproject.toml",
+            "requirements.txt",
+            "Cargo.toml",
+            "go.mod",
+            "Gemfile",
+        ]:
+            dep_file = self.repo_path / pattern
+            if dep_file.exists():
+                dep_files.append(pattern)
+
+        if not dep_files:
+            self.logger.debug(f"[{self.repo_name}] No dependency files found")
+            return True, False
+
+        self.logger.debug(f"[{self.repo_name}] Found dependency files: {dep_files}")
+
+        # Ask agent to analyze and update dependencies
+        response = self.ask_agent(
+            f"Analyze the DIRECT dependencies in this repository and suggest updates. "
+            f"ONLY update direct/top-level dependencies (those explicitly listed in package.json, "
+            f"Cargo.toml, requirements.txt, etc.), NOT transitive/indirect dependencies. "
+            f"Do NOT update dependencies newer than {self.config['dependency_age_threshold']} days "
+            f"unless they are critical security updates. "
+            f"For major version updates, also make any necessary code changes for compatibility. "
+            f"IMPORTANT: After updating, you MUST verify the changes work by running the full build process. "
+            f"For npm projects: run 'npm ci' to verify lock file, then 'npm run build' and 'npm run lint' if available. "
+            f"For cargo: run 'cargo build'. For pip: run 'pip check'. "
+            f"Use correct commands: 'npm install <pkg>@<version>' for npm, 'cargo update -p <pkg>' for cargo, "
+            f"'pip install <pkg>==<version>' for pip. "
+            f"Return a JSON object with 'should_update' (boolean), 'commands' (list of shell commands "
+            f"including both update AND verification commands), and 'reasoning' (string).",
+            context={
+                "dependency_files": dep_files,
+                "age_threshold_days": self.config["dependency_age_threshold"],
+                "has_ci": True,
+            },
+        )
+
+        try:
+            # Extract JSON from response (handles markdown code blocks)
+            response_text = self._extract_json_from_response(response)
+            decision = json.loads(response_text)
+            should_update = decision.get("should_update", False)
+            commands = decision.get("commands", [])
+            reasoning = decision.get("reasoning", "No reasoning provided")
+
+            # Validate response structure
+            if not isinstance(commands, list):
+                self.logger.error(
+                    f"[{self.repo_name}] Invalid agent response: commands must be a list"
+                )
+                return False, False
+
+            # Validate that all items in commands are strings
+            if not all(isinstance(cmd, str) for cmd in commands):
+                self.logger.error(
+                    f"[{self.repo_name}] Invalid agent response: commands must contain only strings"
+                )
+                return False, False
+
+            self.logger.debug(f"[{self.repo_name}] Agent reasoning: {reasoning}")
+
+            if not should_update or not commands:
+                self.logger.debug(f"[{self.repo_name}] No dependency updates needed")
+                return True, False
+
+            # Execute update commands
+            for cmd in commands:
+                if self.config["dry_run"]:
+                    self.logger.info(f"[{self.repo_name}] DRY RUN: Would run: {cmd}")
+                else:
+                    self.logger.debug(f"[{self.repo_name}] Running: {cmd}")
+                    try:
+                        cmd_parts = shlex.split(cmd)
+                    except ValueError as e:
+                        self.logger.error(
+                            f"[{self.repo_name}] Failed to parse command '{cmd}': {e}"
+                        )
+                        return False, False
+
+                    success, _, stderr = self.run_command(cmd_parts, check=False)
+                    if not success:
+                        self.logger.error(
+                            f"[{self.repo_name}] Command failed: {stderr}"
+                        )
+                        return False, False
+
+            # Verify npm lock file is valid (catches out-of-sync issues)
+            if not self.config["dry_run"] and "package.json" in dep_files:
+                self.logger.debug(f"[{self.repo_name}] Verifying npm lock file with npm ci...")
+                success, _, stderr = self.run_command(["npm", "ci"], check=False)
+                if not success:
+                    self.logger.error(
+                        f"[{self.repo_name}] npm ci failed - lock file may be out of sync: {stderr}"
+                    )
+                    return False, False
+
+            # Check if commands actually changed anything
+            if self.config["dry_run"]:
+                return True, True  # Assume changes in dry run
+            had_changes = not self.is_workdir_clean()
+            if had_changes:
+                self.logger.info(f"[{self.repo_name}] Dependencies updated: {', '.join(commands)}")
+            else:
+                self.logger.debug(f"[{self.repo_name}] Update commands ran but no files changed")
+            return True, had_changes
+
+        except json.JSONDecodeError as e:
+            self.logger.error(f"[{self.repo_name}] Failed to parse agent response: {e}")
+            self.logger.error(f"[{self.repo_name}] Agent response was: {response}")
+            return False, False
+
+    def commit_and_push(self, message: str) -> Tuple[bool, bool]:
+        """Commit changes and push to remote.
+
+        Returns:
+            Tuple of (success, had_changes) where:
+            - success: whether the operation completed successfully
+            - had_changes: whether there were changes that were committed
+        """
+        if not self.config["push_changes"]:
+            self.logger.debug(f"[{self.repo_name}] Push disabled in config")
+            return True, False
+
+        # Check if there are changes
+        if self.is_workdir_clean():
+            self.logger.debug(f"[{self.repo_name}] No changes to commit")
+            return True, False
+
+        if self.config["dry_run"]:
+            self.logger.info(
+                f"[{self.repo_name}] DRY RUN: Would commit and push changes"
+            )
+            return True, True  # Would have committed
+
+        # Commit
+        self.logger.debug(f"[{self.repo_name}] Committing changes...")
+
+        # Stage all changes (including new files created by AI)
+        success, _, stderr = self.run_command(["git", "add", "-A"])
+        if not success:
+            self.logger.error(f"[{self.repo_name}] Failed to stage changes: {stderr}")
+            return False, False
+
+        # Check if anything was actually staged
+        success, stdout, _ = self.run_command(
+            ["git", "diff", "--cached", "--name-only"]
+        )
+        if not success or not stdout.strip():
+            self.logger.debug(f"[{self.repo_name}] No changes staged for commit")
+            return True, False  # Not an error, just nothing to commit
+
+        success, _, stderr = self.run_command(["git", "commit", "-m", message])
+        if not success:
+            self.logger.error(f"[{self.repo_name}] Failed to commit: {stderr}")
+            return False, False
+
+        # Get commit hash for logging
+        _, commit_hash, _ = self.run_command(
+            ["git", "rev-parse", "--short", "HEAD"], check=False
+        )
+        commit_hash = commit_hash.strip() or "unknown"
+
+        # Push
+        self.logger.debug(f"[{self.repo_name}] Pushing to remote...")
+        success, _, stderr = self.run_command(["git", "push"])
+        if not success:
+            self.logger.error(f"[{self.repo_name}] Failed to push: {stderr}")
+            return False, False
+
+        self.logger.info(
+            f"[{self.repo_name}] Committed and pushed ({commit_hash})"
+        )
+        return True, True
+
+    def maintain(self) -> Tuple[bool, bool]:
+        """Run full maintenance workflow.
+
+        Returns:
+            Tuple of (success, had_changes) where:
+            - success: whether the operation completed successfully
+            - had_changes: whether there were changes that were committed
+        """
+        self.logger.debug(f"[{self.repo_name}] Starting maintenance")
+
+        # Skip self to prevent modifying this script while running
+        if self.repo_name == "github-maintainer":
+            self.logger.debug(f"[{self.repo_name}] Skipping self")
+            return False, False
+
+        # Check prerequisites
+        if not self.is_git_repo():
+            self.logger.debug(f"[{self.repo_name}] Not a git repository, skipping")
+            return False, False
+
+        default_branch = self.get_default_branch()
+        if not default_branch:
+            self.logger.warning(
+                f"[{self.repo_name}] Could not determine default branch, skipping"
+            )
+            return False, False
+
+        current_branch = self.get_current_branch()
+        if not current_branch:
+            self.logger.warning(
+                f"[{self.repo_name}] Could not determine current branch, skipping"
+            )
+            return False, False
+
+        if current_branch != default_branch:
+            self.logger.warning(
+                f"[{self.repo_name}] Not on default branch ({current_branch} != {default_branch}), skipping"
+            )
+            return False, False
+
+        if not self.is_workdir_clean():
+            self.logger.warning(
+                f"[{self.repo_name}] Working directory not clean, skipping"
+            )
+            return False, False
+
+        # Pull changes
+        if not self.pull_changes():
+            return False, False
+
+        # Verify working directory is still clean after pull
+        # (pull might create merge commits or conflicts)
+        if not self.is_workdir_clean():
+            self.logger.warning(
+                f"[{self.repo_name}] Working directory not clean after pull, skipping"
+            )
+            return False, False
+
+        # Check CI status before making changes (to know if we break it later)
+        ci_was_passing = None
+        if self.config.get("wait_for_ci"):
+            initial_ci = self.get_latest_ci_conclusion()
+            ci_was_passing = initial_ci == "success"
+            if initial_ci == "failure":
+                # Check if the failure was caused by a previous run of this script
+                if self.is_latest_commit_from_maintainer():
+                    self.logger.warning(
+                        f"[{self.repo_name}] CI is failing from a previous github-maintainer run, will attempt to fix"
+                    )
+                    # Try to fix the existing failure before making more changes
+                    logs = self.get_ci_failure_logs()
+                    if logs:
+                        if self.fix_ci_failure(logs):
+                            self.logger.info(f"[{self.repo_name}] Previous CI failure fixed")
+                            ci_was_passing = True  # Now it should pass
+                        else:
+                            self.logger.error(f"[{self.repo_name}] Could not fix previous CI failure, skipping repo")
+                            return False, False
+                    else:
+                        self.logger.error(f"[{self.repo_name}] Could not get CI failure logs")
+                        return False, False
+                else:
+                    self.logger.warning(
+                        f"[{self.repo_name}] CI is already failing (not from github-maintainer), will not attempt fixes"
+                    )
+
+        # Merge dependabot PRs locally
+        success, merged_prs = self.merge_dependabot_prs()
+        if not success:
+            self.logger.error(f"[{self.repo_name}] Failed to merge dependabot PRs")
+            self.reset_changes()
+            return False, False
+
+        # Update dependencies
+        success, had_dep_updates = self.update_dependencies()
+        if not success:
+            self.logger.error(f"[{self.repo_name}] Failed to update dependencies")
+            self.reset_changes()
+            return False, False
+
+        # Only run tests if we made changes (merged PRs or updated dependencies)
+        had_changes = bool(merged_prs) or had_dep_updates
+        if had_changes:
+            tests_passed, test_output = self.run_tests()
+            if not tests_passed:
+                self.logger.error(
+                    f"[{self.repo_name}] Tests failed, not committing changes"
+                )
+                self.logger.error(f"[{self.repo_name}] Test output:\n{test_output}")
+                self.reset_changes()
+                return False, False
+
+        # Commit and push (only if we have changes)
+        success, committed_changes = self.commit_and_push(COMMIT_MESSAGE)
+        if not success:
+            self.reset_changes()
+            return False, False
+
+        # Close merged dependabot PRs on GitHub
+        if committed_changes and merged_prs:
+            self.close_dependabot_prs(merged_prs)
+
+        # Check CI status and fix failures if we caused them
+        if committed_changes and self.config.get("wait_for_ci"):
+            ci_status = self.get_ci_status()
+            if ci_status == "failure":
+                if ci_was_passing:
+                    # CI was passing before, we likely broke it - try to fix
+                    self.logger.warning(f"[{self.repo_name}] CI failed after push, attempting to fix...")
+                    logs = self.get_ci_failure_logs()
+                    if logs:
+                        if self.fix_ci_failure(logs):
+                            self.logger.info(f"[{self.repo_name}] CI failure fixed and pushed")
+                        else:
+                            self.logger.error(f"[{self.repo_name}] Failed to fix CI failure")
+                            return False, True  # Had changes but CI failed
+                    else:
+                        self.logger.error(f"[{self.repo_name}] Could not get CI failure logs")
+                        return False, True
+                else:
+                    # CI was already failing before our changes
+                    self.logger.warning(
+                        f"[{self.repo_name}] CI failed, but was already failing before our changes"
+                    )
+            elif ci_status == "success":
+                self.logger.debug(f"[{self.repo_name}] CI passed")
+
+        if committed_changes:
+            self.logger.info(
+                f"[{self.repo_name}] Maintenance completed successfully with changes"
+            )
+        else:
+            self.logger.debug(
+                f"[{self.repo_name}] Maintenance completed successfully (no changes)"
+            )
+        return True, committed_changes
+
+
+def find_repos(base_dir: Path, logger: logging.Logger) -> List[Path]:
+    """Find all git repositories in the specified directory."""
+    if not base_dir.exists():
+        logger.error(f"Directory not found: {base_dir}")
+        return []
+
+    if not base_dir.is_dir():
+        logger.error(f"Not a directory: {base_dir}")
+        return []
+
+    # Only include git repositories, excluding hidden directories and symlinks
+    repos = []
+    try:
+        for item in base_dir.iterdir():
+            try:
+                if (
+                    item.is_dir()
+                    and not item.is_symlink()
+                    and not item.name.startswith(".")
+                    and (item / ".git").exists()
+                ):
+                    repos.append(item)
+            except PermissionError:
+                logger.error(f"Permission denied: {item}")
+    except PermissionError:
+        logger.error(f"Permission denied: {base_dir}")
+        return []
+
+    # Sort alphabetically for consistent ordering
+    repos.sort(key=lambda p: p.name.lower())
+
+    logger.debug(f"Found {len(repos)} git repositories in {base_dir}")
+    return repos
+
+
+def setup_logging(log_path: Optional[Path], verbose: bool) -> logging.Logger:
+    """Setup logging configuration."""
+    level = logging.DEBUG if verbose else logging.INFO
+
+    handlers = [logging.StreamHandler()]
+    if log_path:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        handlers.append(logging.FileHandler(log_path))
+
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s - %(levelname)s - %(message)s",
+        handlers=handlers,
+    )
+
+    return logging.getLogger(__name__)
+
+
+def check_prerequisites(agent_command: str) -> List[str]:
+    """Check for required tools before running."""
+    missing = []
+    required_tools = ["git", "gh"]
+
+    # Extract the actual command from agent_command (might be "ollama run llama3")
+    try:
+        agent_parts = shlex.split(agent_command)
+        if agent_parts:
+            agent_binary = agent_parts[0]
+            required_tools.append(agent_binary)
+    except ValueError:
+        # Malformed agent_command, add default
+        required_tools.append("claude")
+
+    for tool in required_tools:
+        if not shutil.which(tool):
+            missing.append(tool)
+
+    return missing
+
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(
+        description="Automated GitHub repository maintenance with AI-assisted decision making.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Run in current directory
+  %(prog)s
+
+  # Specify directory to scan
+  %(prog)s --base-dir ~/src/github.com/username
+
+  # Dry run mode (don't push changes)
+  %(prog)s --dry-run
+
+  # Only update 5 repositories with changes
+  %(prog)s --limit 5
+
+  # Use different AI agent
+  %(prog)s --agent-command "ollama run llama3"
+
+  # Disable specific features
+  %(prog)s --no-merge-dependabot --no-update-dependencies
+
+  # Custom dependency age threshold (60 days)
+  %(prog)s --dependency-age-threshold 60
+        """,
+    )
+
+    parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+
+    # Directory
+    parser.add_argument(
+        "--base-dir",
+        "-d",
+        type=Path,
+        default=Path.cwd(),
+        help="Directory to scan for repositories (default: current directory)",
+    )
+
+    # AI agent configuration
+    parser.add_argument(
+        "--agent-command", default="claude", help="AI agent command (default: claude)"
+    )
+    parser.add_argument(
+        "--agent-flags",
+        default="--dangerously-skip-permissions",
+        help="Flags to pass to AI agent (default: --dangerously-skip-permissions)",
+    )
+
+    # Dependency configuration
+    parser.add_argument(
+        "--dependency-age-threshold",
+        type=int,
+        default=DEFAULT_DEPENDENCY_AGE_DAYS,
+        help=f"Don't update dependencies newer than N days (default: {DEFAULT_DEPENDENCY_AGE_DAYS})",
+    )
+
+    # Feature toggles
+    parser.add_argument(
+        "--no-merge-dependabot",
+        action="store_true",
+        help="Disable automatic merging of dependabot PRs",
+    )
+    parser.add_argument(
+        "--no-update-dependencies",
+        action="store_true",
+        help="Disable automatic dependency updates",
+    )
+    parser.add_argument(
+        "--no-run-tests", action="store_true", help="Skip running tests"
+    )
+    parser.add_argument(
+        "--no-push", action="store_true", help="Don't push changes to remote"
+    )
+    parser.add_argument(
+        "--wait-for-ci",
+        action="store_true",
+        help="Wait for CI to complete after push and attempt to fix failures",
+    )
+
+    # Operation mode
+    parser.add_argument(
+        "--dry-run",
+        "-n",
+        action="store_true",
+        help="Dry run mode (don't actually push changes)",
+    )
+
+    # Limiting
+    parser.add_argument(
+        "--limit",
+        type=int,
+        help="Only update N repositories with changes (default: unlimited)",
+    )
+
+    # Logging
+    parser.add_argument(
+        "--log-file",
+        "-l",
+        type=Path,
+        help="Log file path (default: no log file, stdout only)",
+    )
+    parser.add_argument(
+        "--verbose", "-v", action="store_true", help="Verbose output (debug level)"
+    )
+
+    return parser.parse_args()
+
+
+def main():
+    """Main entry point."""
+    # Setup signal handlers for graceful interruption
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
+
+    args = parse_args()
+
+    # Validate arguments
+    if args.limit is not None and args.limit <= 0:
+        print(f"Error: --limit must be a positive integer, got {args.limit}", file=sys.stderr)
+        return 1
+
+    # Setup logging
+    logger = setup_logging(args.log_file, args.verbose)
+
+    # Check prerequisites
+    missing_tools = check_prerequisites(args.agent_command)
+    if missing_tools:
+        logger.error(f"Missing required tools: {', '.join(missing_tools)}")
+        logger.error("Please install the missing tools and try again")
+        return 1
+
+    # Build configuration
+    config = {
+        "agent_command": args.agent_command,
+        "agent_flags": args.agent_flags,
+        "dependency_age_threshold": args.dependency_age_threshold,
+        "auto_merge_dependabot": not args.no_merge_dependabot,
+        "auto_update_dependencies": not args.no_update_dependencies,
+        "run_tests": not args.no_run_tests,
+        "push_changes": not args.no_push,
+        "wait_for_ci": args.wait_for_ci,
+        "dry_run": args.dry_run,
+    }
+
+    logger.info("=" * 80)
+    logger.info(f"GitHub Maintainer v{__version__} - {datetime.now().isoformat()}")
+    logger.info(f"Scanning directory: {args.base_dir}")
+    logger.info(f"Agent command: {config['agent_command']} {config['agent_flags']}")
+    logger.info(f"Dry run: {config['dry_run']}")
+    if args.limit:
+        logger.info(f"Limit: {args.limit} repositories with changes")
+    logger.info("=" * 80)
+
+    # Find repositories
+    repos = find_repos(args.base_dir, logger)
+    if not repos:
+        logger.error("No repositories found")
+        return 1
+
+    # Process each repository
+    success_count = 0
+    skip_count = 0
+    error_count = 0
+    repos_with_changes = 0
+    interrupted = False
+
+    try:
+        for repo_path in repos:
+            # Check if we've reached the limit
+            if args.limit and repos_with_changes >= args.limit:
+                logger.info(
+                    f"Reached limit of {args.limit} repositories with changes, stopping"
+                )
+                break
+
+            maintainer = RepoMaintainer(repo_path, config)
+            try:
+                success, had_changes = maintainer.maintain()
+                if success:
+                    success_count += 1
+                    if had_changes:
+                        repos_with_changes += 1
+                else:
+                    skip_count += 1
+            except KeyboardInterrupt:
+                raise  # Re-raise to exit the loop
+            except Exception as e:
+                logger.error(f"[{repo_path.name}] Unexpected error: {e}", exc_info=True)
+                error_count += 1
+    except KeyboardInterrupt:
+        logger.warning("Interrupted by user")
+        interrupted = True
+
+    # Summary
+    logger.info("=" * 80)
+    logger.info("Maintenance complete" + (" (interrupted)" if interrupted else ""))
+    logger.info(f"Successful: {success_count}")
+    logger.info(f"With changes: {repos_with_changes}")
+    logger.info(f"Skipped: {skip_count}")
+    logger.info(f"Errors: {error_count}")
+    logger.info("=" * 80)
+
+    return 1 if interrupted or error_count > 0 else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
