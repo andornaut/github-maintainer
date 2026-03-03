@@ -334,6 +334,13 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
                 self.logger.error(f"[{self.repo_name}] Agent failed: {error_msg}")
                 return json.dumps({"error": error_msg})
 
+        except KeyboardInterrupt:
+            # Let the agent finish, then exit gracefully
+            self.logger.warning(
+                f"[{self.repo_name}] Interrupted, waiting for agent to finish..."
+            )
+            stdout, stderr = proc.communicate()  # Wait without timeout
+            raise  # Re-raise to exit the script
         except subprocess.TimeoutExpired:
             # Kill entire process group to ensure child processes are terminated
             try:
