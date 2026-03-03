@@ -357,12 +357,29 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
         return json.loads(self._extract_json_from_response(response))
 
     def _extract_json_from_response(self, response: str) -> str:
-        """Extract JSON from agent response, handling markdown code blocks."""
+        """Extract JSON from agent response, handling various formats.
+
+        Handles:
+        - Markdown code blocks (```json ... ``` or ``` ... ```)
+        - Raw JSON objects with surrounding text
+        - Plain JSON responses
+        """
         if not response or not response.strip():
             return '{"error": "Empty agent response"}'
+
+        # Try markdown code blocks first
         match = re.search(r"```(?:json)?\s*([\s\S]*?)```", response)
-        extracted = match.group(1).strip() if match else response.strip()
-        return extracted if extracted else '{"error": "Empty agent response"}'
+        if match:
+            extracted = match.group(1).strip()
+            if extracted:
+                return extracted
+
+        # Try to find a JSON object in the response (handles text before/after JSON)
+        match = re.search(r"\{[\s\S]*\}", response)
+        if match:
+            return match.group(0)
+
+        return '{"error": "No JSON found in agent response"}'
 
 
 class GitClient:

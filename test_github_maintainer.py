@@ -122,6 +122,24 @@ class TestAgentClientJsonExtraction:
         result = client._extract_json_from_response(response)
         assert result == '{"fixed": false}'
 
+    def test_extract_json_with_text_before(self, default_config):
+        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
+        response = """Some explanation text here.
+
+{"updated": false, "changes_made": "", "reasoning": "All up to date"}"""
+        result = client._extract_json_from_response(response)
+        assert result == '{"updated": false, "changes_made": "", "reasoning": "All up to date"}'
+
+    def test_extract_json_empty_response(self, default_config):
+        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
+        result = client._extract_json_from_response("")
+        assert "error" in result
+
+    def test_extract_json_no_json_found(self, default_config):
+        client = gm.AgentClient(Path("/tmp"), "test-repo", default_config, MagicMock())
+        result = client._extract_json_from_response("Just plain text with no JSON")
+        assert "error" in result
+
 
 class TestRunCommand:
     """Tests for run_command function."""
