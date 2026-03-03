@@ -35,13 +35,16 @@ MaintainResult = Tuple[bool, bool]  # (success, had_changes)
 MergeResult = Tuple[bool, List[int]]  # (success, merged_pr_numbers)
 TestResult = Tuple[bool, str]  # (success, output)
 
-AGENT_TIMEOUT_SECONDS = 300
+# Default values for CLI arguments and configuration
 DEFAULT_AGENT_COMMAND = "claude"
 DEFAULT_AGENT_FLAGS = "--dangerously-skip-permissions"
+DEFAULT_AGENT_TIMEOUT_SECONDS = 300
+DEFAULT_CI_LOG_MAX_LENGTH = 10000
 DEFAULT_CI_TIMEOUT_MINUTES = 10
-DEFAULT_DEPENDENCY_AGE_DAYS = 30
+DEFAULT_DEPENDENCY_MIN_AGE_DAYS = 30
 DEFAULT_MAX_FIX_ATTEMPTS = 4
-MAX_CI_LOG_LENGTH = 10000
+
+# Other constants
 TOOL_REPO_URL = "https://github.com/andornaut/github-maintainer"
 
 # Dependency files to check for in repositories
@@ -317,7 +320,7 @@ Respond with ONLY a JSON object. No explanations, no markdown outside the JSON.
                 env=env,
                 start_new_session=True,
             )
-            stdout, stderr = proc.communicate(timeout=AGENT_TIMEOUT_SECONDS)
+            stdout, stderr = proc.communicate(timeout=DEFAULT_AGENT_TIMEOUT_SECONDS)
 
             if proc.returncode == 0:
                 return stdout
@@ -606,8 +609,8 @@ class GitHubClient:
         if not success or not stdout:
             return None
         # Truncate if too long
-        if len(stdout) > MAX_CI_LOG_LENGTH:
-            return stdout[:MAX_CI_LOG_LENGTH] + "\n... (truncated)"
+        if len(stdout) > DEFAULT_CI_LOG_MAX_LENGTH:
+            return stdout[:DEFAULT_CI_LOG_MAX_LENGTH] + "\n... (truncated)"
         return stdout
 
     def get_dependabot_prs(self) -> List[Dict[str, Any]]:
@@ -1812,8 +1815,8 @@ Examples:
     parser.add_argument(
         "--dependency-min-age-days",
         type=int,
-        default=DEFAULT_DEPENDENCY_AGE_DAYS,
-        help=f"Skip dependencies newer than N days (default: {DEFAULT_DEPENDENCY_AGE_DAYS})",
+        default=DEFAULT_DEPENDENCY_MIN_AGE_DAYS,
+        help=f"Skip dependencies newer than N days (default: {DEFAULT_DEPENDENCY_MIN_AGE_DAYS})",
     )
 
     # Feature toggles
